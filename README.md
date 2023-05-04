@@ -1,5 +1,5 @@
-# ink! project template
-[![Built with ink!](https://raw.githubusercontent.com/paritytech/ink/master/.images/badge.svg)](https://github.com/paritytech/ink) [![continuous-intergration/ink-project-template](https://github.com/paritytech/ink-project-template/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/paritytech/ink-project-template/actions/workflows/ci.yml)
+# Polkapobal
+[![Built with ink!](https://raw.githubusercontent.com/paritytech/ink/master/.images/badge.svg)](https://github.com/paritytech/ink) [![continuous-intergration/ink-project-template](https://github.com/paritytech/ink-project-template/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/paritytech/polkapobal/actions/workflows/ci.yml)
 
 ## Local development setup
 

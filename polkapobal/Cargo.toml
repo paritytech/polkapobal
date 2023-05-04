@@ -1,5 +1,5 @@
 [package]
-name = "ink_project_template"
+name = "polkapobal"
 version = "0.1.0"
 authors = ["[your_name] <[your_email]>"]
 edition = "2021"
@@ -11,7 +11,7 @@ scale = { package = "parity-scale-codec", version = "3", default-features = fals
 scale-info = { version = "2.3", default-features = false, features = ["derive"], optional = true }
 
 [dev-dependencies]
-ink_e2e = "4.1.0"
+ink_e2e = "4.0.1"
 
 [lib]
 path = "lib.rs"
