@@ -2,141 +2,223 @@
 
 #[ink::contract]
 mod polkapobal {
+    use ink::{
+        prelude::vec::Vec,
+        storage::Mapping,
+    };
 
-    /// Defines the storage of your contract.
-    /// Add new fields to the below struct in order
-    /// to add new static storage fields to your contract.
+    #[ink(event)]
+    pub struct MemberRegistered {
+        /// The member that was added.
+        #[ink(topic)]
+        member: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct MemberDeregistered {
+        /// The member that was removed.
+        #[ink(topic)]
+        member: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct MembersCleared {}
+
     #[ink(storage)]
     pub struct Polkapobal {
-        /// Stores a single `bool` value on the storage.
-        value: bool,
+        owner: AccountId,
+        members: Vec<AccountId>,
+        is_member: Mapping<AccountId, ()>,
     }
 
     impl Polkapobal {
-        /// Constructor that initializes the `bool` value to the given `init_value`.
         #[ink(constructor)]
-        pub fn new(init_value: bool) -> Self {
-            Self { value: init_value }
+        pub fn new() -> Self {
+            Polkapobal {
+                owner: Self::env().caller(),
+                members: Vec::new(),
+                is_member: Mapping::default(),
+            }
         }
 
-        /// Constructor that initializes the `bool` value to `false`.
-        ///
-        /// Constructors can delegate to other constructors.
-        #[ink(constructor)]
-        pub fn default() -> Self {
-            Self::new(Default::default())
-        }
-
-        /// A message that can be called on instantiated contracts.
-        /// This one flips the value of the stored `bool` from `true`
-        /// to `false` and vice versa.
         #[ink(message)]
-        pub fn flip(&mut self) {
-            self.value = !self.value;
+        pub fn register_member(&mut self) {
+            let caller = self.env().caller();
+
+            // Ensure that the member does not exist
+            assert!(!self.is_member.contains(&caller), "Member already exists");
+
+            self.is_member.insert(caller, &());
+            self.members.push(caller);
+
+            self.env().emit_event(MemberRegistered { member: caller });
         }
 
-        /// Simply returns the current value of our `bool`.
         #[ink(message)]
-        pub fn get(&self) -> bool {
-            self.value
+        pub fn deregister_member(&mut self) {
+            let caller = self.env().caller();
+
+            // Ensure that the member exists
+            assert!(self.is_member.contains(&caller), "Member does not exist");
+            // Search for index of member
+            let index = self
+                .members
+                .iter()
+                .position(|x| *x == caller)
+                .expect("Member existence verified before calling");
+            self.members.swap_remove(index);
+            self.is_member.remove(caller);
+
+            self.env().emit_event(MemberDeregistered { member: caller });
+        }
+
+        #[ink(message)]
+        pub fn clear_members(&mut self) {
+            let caller = self.env().caller();
+
+            // Ensure that the caller is the owner
+            assert_eq!(caller, self.owner, "Only owner can clear members");
+
+            // Iterate over `members` vec and remove each member.
+            // Done in reverse so the member indices' do not change.
+            for (i, member) in self.members.clone().iter().enumerate().rev() {
+                self.is_member.remove(member);
+                self.members.swap_remove(i);
+            }
+
+            self.env().emit_event(MembersCleared {});
         }
     }
 
-    /// Unit tests in Rust are normally defined within such a `#[cfg(test)]`
-    /// module and test functions are marked with a `#[test]` attribute.
-    /// The below code is technically just normal Rust code.
     #[cfg(test)]
     mod tests {
         /// Imports all the definitions from the outer scope so we can use them here.
         use super::*;
+        use ink::env::test;
 
-        /// We test if the default constructor does its job.
         #[ink::test]
-        fn default_works() {
-            let polkapobal = Polkapobal::default();
-            assert_eq!(polkapobal.get(), false);
+        fn construction_works() {
+            let expected = Polkapobal {
+                owner: AccountId::from([0x01; 32]),
+                members: Vec::new(),
+                is_member: Mapping::default(),
+            };
+
+            let contract = Polkapobal::new();
+            assert_eq!(contract.owner, expected.owner);
+            assert_eq!(contract.members.len(), 0);
         }
 
-        /// We test a simple use case of our contract.
         #[ink::test]
-        fn it_works() {
-            let mut polkapobal = Polkapobal::new(false);
-            assert_eq!(polkapobal.get(), false);
-            polkapobal.flip();
-            assert_eq!(polkapobal.get(), true);
-        }
-    }
+        fn register_member_works() {
+            let mut contract = Polkapobal::new();
 
+            let accounts =
+                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
-    /// This is how you'd write end-to-end (E2E) or integration tests for ink! contracts.
-    ///
-    /// When running these you need to make sure that you:
-    /// - Compile the tests with the `e2e-tests` feature flag enabled (`--features e2e-tests`)
-    /// - Are running a Substrate node which contains `pallet-contracts` in the background
-    #[cfg(all(test, feature = "e2e-tests"))]
-    mod e2e_tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
-        use super::*;
+            contract.register_member();
 
-        /// A helper function used for calling contract messages.
-        use ink_e2e::build_message;
+            ink::env::test::set_caller::<Environment>(accounts.bob);
+            contract.register_member();
 
-        /// The End-to-End test `Result` type.
-        type E2EResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-        /// We test that we can upload and instantiate the contract using its default constructor.
-        #[ink_e2e::test]
-        async fn default_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let constructor = PolkapobalRef::default();
-
-            // When
-            let contract_account_id = client
-                .instantiate("polkapobal", &ink_e2e::alice(), constructor, 0, None)
-                .await
-                .expect("instantiate failed")
-                .account_id;
-
-            // Then
-            let get = build_message::<PolkapobalRef>(contract_account_id.clone())
-                .call(|polkapobal| polkapobal.get());
-            let get_result = client.call_dry_run(&ink_e2e::alice(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), false));
-
-            Ok(())
+            assert_eq!(contract.members.len(), 2);
+            assert!(contract.members.contains(&accounts.alice));
+            assert!(contract.members.contains(&accounts.bob));
+            assert!(contract.is_member.contains(accounts.alice));
+            assert!(contract.is_member.contains(accounts.bob));
+            assert_eq!(test::recorded_events().count(), 2);
         }
 
-        /// We test that we can read and write a value from the on-chain contract contract.
-        #[ink_e2e::test]
-        async fn it_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let constructor = PolkapobalRef::new(false);
-            let contract_account_id = client
-                .instantiate("polkapobal", &ink_e2e::bob(), constructor, 0, None)
-                .await
-                .expect("instantiate failed")
-                .account_id;
+        #[ink::test]
+        fn deregister_member_works() {
+            let mut contract = Polkapobal::new();
 
-            let get = build_message::<PolkapobalRef>(contract_account_id.clone())
-                .call(|polkapobal| polkapobal.get());
-            let get_result = client.call_dry_run(&ink_e2e::bob(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), false));
+            let accounts =
+                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
-            // When
-            let flip = build_message::<PolkapobalRef>(contract_account_id.clone())
-                .call(|polkapobal| polkapobal.flip());
-            let _flip_result = client
-                .call(&ink_e2e::bob(), flip, 0, None)
-                .await
-                .expect("flip failed");
+            contract.register_member();
 
-            // Then
-            let get = build_message::<PolkapobalRef>(contract_account_id.clone())
-                .call(|polkapobal| polkapobal.get());
-            let get_result = client.call_dry_run(&ink_e2e::bob(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), true));
+            ink::env::test::set_caller::<Environment>(accounts.bob);
+            contract.register_member();
 
-            Ok(())
+            ink::env::test::set_caller::<Environment>(accounts.charlie);
+            contract.register_member();
+
+            assert_eq!(contract.members.len(), 3);
+            contract.deregister_member();
+            assert_eq!(contract.members.len(), 2);
+            assert!(!contract.members.contains(&accounts.charlie));
+            assert!(!contract.is_member.contains(&accounts.charlie));
+
+            ink::env::test::set_caller::<Environment>(accounts.bob);
+            contract.deregister_member();
+            assert_eq!(contract.members.len(), 1);
+            assert!(!contract.members.contains(&accounts.bob));
+            assert!(!contract.is_member.contains(&accounts.bob));
+
+            ink::env::test::set_caller::<Environment>(accounts.alice);
+            contract.deregister_member();
+            assert_eq!(contract.members.len(), 0);
+            assert!(!contract.members.contains(&accounts.alice));
+            assert!(!contract.is_member.contains(&accounts.alice));
+            assert_eq!(test::recorded_events().count(), 6);
+        }
+
+        #[ink::test]
+        fn clear_members_works() {
+            let mut contract = Polkapobal::new();
+
+            let accounts =
+                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            contract.register_member();
+
+            ink::env::test::set_caller::<Environment>(accounts.bob);
+            contract.register_member();
+
+            ink::env::test::set_caller::<Environment>(accounts.charlie);
+            contract.register_member();
+
+            assert_eq!(contract.members.len(), 3);
+
+            ink::env::test::set_caller::<Environment>(accounts.alice);
+            contract.clear_members();
+
+            assert_eq!(contract.members.len(), 0);
+            assert!(!contract.is_member.contains(&accounts.alice));
+            assert!(!contract.is_member.contains(&accounts.bob));
+            assert!(!contract.is_member.contains(&accounts.charlie));
+            assert_eq!(test::recorded_events().count(), 4);
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Member already exists")]
+        fn register_member_panics() {
+            let mut contract = Polkapobal::new();
+
+            contract.register_member();
+            // Should panic here
+            contract.register_member();
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Member does not exist")]
+        fn deregister_member_panics() {
+            let mut contract = Polkapobal::new();
+
+            contract.deregister_member();
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Only owner can clear members")]
+        fn clear_members_panics() {
+            let mut contract = Polkapobal::new();
+
+            let accounts =
+                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            ink::env::test::set_caller::<Environment>(accounts.bob);
+            contract.clear_members();
         }
     }
 }
