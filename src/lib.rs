@@ -5,6 +5,11 @@ mod polkapobal {
     use ink::{prelude::string::String, prelude::vec::Vec, storage::Mapping};
 
     #[ink(event)]
+    pub struct SelectionEraChanged {
+        new_era: u32,
+    }
+
+    #[ink(event)]
     pub struct MemberRegistered {
         /// The member that was added.
         #[ink(topic)]
@@ -47,28 +52,65 @@ mod polkapobal {
         amount: Balance,
     }
 
+    #[ink(event)]
+    pub struct NewEraStarted {
+        era: u32,
+        #[ink(topic)]
+        participants: Vec<AccountId>,
+        #[ink(topic)]
+        task: String,
+    }
+
     #[ink(storage)]
     pub struct Polkapobal {
         owner: AccountId,
         members: Vec<AccountId>,
         is_member: Mapping<AccountId, ()>,
-        active_tasks: Vec<String>,
+        tasks: Vec<String>,
         // task -> (is_complete, funds)
         task_info: Mapping<String, (bool, Balance)>,
         unclaimed_funds: Balance,
+        start_block: u32,
+        // How many blocks until next selection
+        next_selection: u32,
+        // Last selection block number
+        last_selection: u32,
+        active_participants: Vec<AccountId>,
+        // (task, is_complete)
+        active_task: Option<(String, bool)>,
+        // task -> proof hash
+        proofs: Mapping<String, Hash>,
     }
 
     impl Polkapobal {
         #[ink(constructor)]
-        pub fn new() -> Self {
+        pub fn new(selection_era: u32) -> Self {
+            let current_block = Self::env().block_number();
             Polkapobal {
                 owner: Self::env().caller(),
                 members: Vec::new(),
                 is_member: Mapping::default(),
-                active_tasks: Vec::new(),
+                tasks: Vec::new(),
                 task_info: Mapping::default(),
                 unclaimed_funds: 0,
+                start_block: current_block,
+                next_selection: selection_era,
+                last_selection: current_block,
+                active_participants: Vec::new(),
+                active_task: None,
+                proofs: Mapping::default(),
             }
+        }
+
+        #[ink(message)]
+        pub fn set_selection_era(&mut self, selection_era: u32) {
+            self.ensure_owner();
+
+            self.next_selection = selection_era;
+
+            self.env().emit_event(SelectionEraChanged {
+                new_era: selection_era,
+            })
         }
 
         #[ink(message)]
@@ -125,7 +167,7 @@ mod polkapobal {
             assert!(!self.task_info.contains(&task), "Task already exists");
 
             self.task_info.insert(&task, &(false, 0));
-            self.active_tasks.push(task.clone());
+            self.tasks.push(task.clone());
 
             self.env().emit_event(TaskAdded { task: task });
         }
@@ -150,11 +192,11 @@ mod polkapobal {
 
             // Search for index of member
             let index = self
-                .active_tasks
+                .tasks
                 .iter()
                 .position(|x| *x == task)
                 .expect("Task existence verified before calling");
-            self.active_tasks.swap_remove(index);
+            self.tasks.swap_remove(index);
 
             self.env().emit_event(TaskRemoved { task: task });
         }
@@ -165,7 +207,7 @@ mod polkapobal {
 
             // Iterate over `active_tasks` vec and remove each member.
             // Done in reverse so the task indices' do not change.
-            for (i, task) in self.active_tasks.clone().iter().enumerate().rev() {
+            for (i, task) in self.tasks.clone().iter().enumerate().rev() {
                 let task_info = self
                     .task_info
                     .take(task)
@@ -175,7 +217,7 @@ mod polkapobal {
                     .checked_add(task_info.1)
                     .expect("Balance overflow");
 
-                self.active_tasks.swap_remove(i);
+                self.tasks.swap_remove(i);
             }
 
             self.env().emit_event(TasksCleared {});
@@ -210,6 +252,71 @@ mod polkapobal {
             });
         }
 
+        #[ink(message)]
+        pub fn start_new_era(&mut self) {
+            self.ensure_era_reached();
+            // TODO: simplified logic for MVP
+            self.ensure_active_task_complete();
+
+            let members = self.randomly_select_members();
+            let task = self.randomly_select_task();
+
+            self.last_selection = self.env().block_number();
+            self.active_participants = members.clone();
+            self.active_task = Some((task.clone(), false));
+
+            self.env().emit_event(NewEraStarted {
+                era: Self::env().block_number(),
+                participants: members,
+                task: task,
+            });
+        }
+
+        #[ink(message)]
+        pub fn upload_completion_proof(&mut self, proof: Hash) {
+            let caller = self.env().caller();
+
+            assert!(
+                self.active_participants.contains(&caller),
+                "Caller must be active participant"
+            );
+
+            if let Some(task) = &self.active_task {
+                self.proofs.insert(&task.0, &proof);
+            }
+        }
+
+        #[ink(message)]
+        pub fn complete_task(&mut self) {
+            self.ensure_owner();
+
+            if let Some(task) = &self.active_task {
+                self.task_info.insert(&task.0, &(true, 0));
+            }
+        }
+
+        fn randomly_select_members(&self) -> Vec<AccountId> {
+            // TODO: use randomness when chain extension is added
+
+            self.ensure_non_empty_members();
+
+            let mut members: Vec<AccountId> = Vec::new();
+            for i in 0..4 {
+                let member =
+                    self.members[(Self::env().block_number() as usize + i) % self.members.len()];
+                members.push(member);
+            }
+
+            members
+        }
+
+        fn randomly_select_task(&self) -> String {
+            self.ensure_non_empty_tasks();
+
+            // TODO: use randomness
+            self.tasks[Self::env().block_number() as usize % self.tasks.len()].clone()
+        }
+
         fn ensure_owner(&self) {
             assert_eq!(self.env().caller(), self.owner, "Only owner can call");
         }
@@ -220,6 +327,28 @@ mod polkapobal {
                 "Must be a member to call"
             );
         }
+
+        fn ensure_non_empty_members(&self) {
+            assert!(self.members.len() > 0, "Must have at least one member");
+        }
+
+        fn ensure_non_empty_tasks(&self) {
+            assert!(self.tasks.len() > 0, "Must have at least one task");
+        }
+
+        fn ensure_active_task_complete(&self) {
+            if let Some(task) = &self.active_task {
+                assert!(task.1, "Active task must be completed");
+            }
+            // if None, simply return
+        }
+
+        fn ensure_era_reached(&self) {
+            assert!(
+                self.env().block_number() >= self.last_selection + self.next_selection,
+                "Selection era not reached"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -227,7 +356,13 @@ mod polkapobal {
         /// Imports all the definitions from the outer scope so we can use them here.
         use super::*;
         use ink::codegen::Env;
-        use ink::env::test;
+        use ink::env::test::{self};
+
+        const DEFAULT_SELECTION_ERA: u32 = 10;
+
+        fn create_default_contract() -> Polkapobal {
+            Polkapobal::new(DEFAULT_SELECTION_ERA)
+        }
 
         fn set_balance(account_id: AccountId, balance: Balance) {
             ink::env::test::set_account_balance::<ink::env::DefaultEnvironment>(account_id, balance)
@@ -238,26 +373,58 @@ mod polkapobal {
                 .expect("Cannot get account balance")
         }
 
+        fn advance_block(num_blocks: u32) {
+            for _ in 0..num_blocks {
+                ink::env::test::advance_block::<ink::env::DefaultEnvironment>();
+            }
+        }
+
         #[ink::test]
         fn construction_works() {
+            let init_block = 5;
+            // non-zero block number to test
+            advance_block(init_block);
+
             let expected = Polkapobal {
                 owner: AccountId::from([0x01; 32]),
                 members: Vec::new(),
                 is_member: Mapping::default(),
-                active_tasks: Vec::new(),
+                tasks: Vec::new(),
                 task_info: Mapping::default(),
                 unclaimed_funds: 0,
+                start_block: init_block,
+                next_selection: DEFAULT_SELECTION_ERA,
+                last_selection: init_block,
+                active_participants: Vec::new(),
+                active_task: None,
+                proofs: Mapping::default(),
             };
 
-            let contract = Polkapobal::new();
+            let contract = Polkapobal::new(DEFAULT_SELECTION_ERA);
             assert_eq!(contract.owner, expected.owner);
             assert_eq!(contract.members.len(), 0);
-            assert_eq!(contract.active_tasks.len(), 0);
+            assert_eq!(contract.tasks.len(), 0);
+            assert_eq!(contract.unclaimed_funds, expected.unclaimed_funds);
+            assert_eq!(contract.start_block, expected.start_block);
+            assert_eq!(contract.next_selection, expected.next_selection);
+            assert_eq!(contract.last_selection, expected.last_selection);
+            assert_eq!(contract.active_participants.len(), 0);
+            assert_eq!(contract.active_task, None);
+        }
+
+        #[ink::test]
+        fn set_selection_era_works() {
+            let mut contract = create_default_contract();
+
+            contract.set_selection_era(20);
+
+            assert_eq!(contract.next_selection, 20);
+            assert_eq!(test::recorded_events().count(), 1);
         }
 
         #[ink::test]
         fn register_member_works() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -276,7 +443,7 @@ mod polkapobal {
 
         #[ink::test]
         fn deregister_member_works() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -310,7 +477,7 @@ mod polkapobal {
 
         #[ink::test]
         fn clear_members_works() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -336,7 +503,7 @@ mod polkapobal {
 
         #[ink::test]
         fn add_task_works() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             contract.register_member();
 
@@ -345,7 +512,7 @@ mod polkapobal {
             contract.add_task(task1.clone());
             contract.add_task(task2.clone());
 
-            assert_eq!(contract.active_tasks.len(), 2);
+            assert_eq!(contract.tasks.len(), 2);
             assert_eq!(contract.task_info.get(&task1).unwrap(), (false, 0));
             assert_eq!(contract.task_info.get(&task2).unwrap(), (false, 0));
             assert_eq!(test::recorded_events().count(), 3);
@@ -356,7 +523,7 @@ mod polkapobal {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             ink::env::test::set_caller::<Environment>(accounts.eve);
 
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
             let contract_address = contract.env().account_id();
 
             contract.register_member();
@@ -366,7 +533,7 @@ mod polkapobal {
             contract.add_task(task1.clone());
             contract.add_task(task2.clone());
 
-            assert_eq!(contract.active_tasks.len(), 2);
+            assert_eq!(contract.tasks.len(), 2);
             assert_eq!(contract.task_info.get(&task1).unwrap(), (false, 0));
             assert_eq!(contract.task_info.get(&task2).unwrap(), (false, 0));
 
@@ -378,14 +545,14 @@ mod polkapobal {
 
             contract.remove_task(task1.clone());
 
-            assert_eq!(contract.active_tasks.len(), 1);
+            assert_eq!(contract.tasks.len(), 1);
             assert_eq!(contract.task_info.get(&task1), None);
             assert_eq!(contract.unclaimed_funds, 10);
             assert_eq!(get_balance(contract_address), 30);
 
             contract.remove_task(task2.clone());
 
-            assert_eq!(contract.active_tasks.len(), 0);
+            assert_eq!(contract.tasks.len(), 0);
             assert_eq!(contract.task_info.get(&task2), None);
             assert_eq!(contract.unclaimed_funds, 30);
             assert_eq!(get_balance(contract_address), 30);
@@ -398,7 +565,7 @@ mod polkapobal {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             ink::env::test::set_caller::<Environment>(accounts.eve);
 
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
             let contract_address = contract.env().account_id();
 
             contract.register_member();
@@ -416,11 +583,11 @@ mod polkapobal {
             ink::env::pay_with_call!(contract.fund_task(task1.clone()), 10);
             ink::env::pay_with_call!(contract.fund_task(task2.clone()), 20);
 
-            assert_eq!(contract.active_tasks.len(), 3);
+            assert_eq!(contract.tasks.len(), 3);
 
             contract.clear_tasks();
 
-            assert_eq!(contract.active_tasks.len(), 0);
+            assert_eq!(contract.tasks.len(), 0);
 
             assert!(!contract.task_info.contains(&task1));
             assert!(!contract.task_info.contains(&task2));
@@ -433,7 +600,7 @@ mod polkapobal {
 
         #[ink::test]
         fn fund_task_works() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -446,7 +613,7 @@ mod polkapobal {
             let task1 = String::from("Task 1");
             contract.add_task(task1.clone());
 
-            assert_eq!(contract.active_tasks.len(), 1);
+            assert_eq!(contract.tasks.len(), 1);
             assert_eq!(contract.task_info.get(&task1).unwrap(), (false, 0));
 
             set_balance(accounts.eve, 100);
@@ -462,9 +629,76 @@ mod polkapobal {
         }
 
         #[ink::test]
+        fn start_new_era_works() {
+            let init_block = 10;
+            advance_block(init_block);
+
+            let mut contract = create_default_contract();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            let mut members: Vec<AccountId> = Vec::new();
+
+            let num_members: u8 = 100;
+            // register 100 members with account ids 0..99
+            for i in 0..num_members {
+                let member = AccountId::from([i; 32]);
+                members.push(member);
+
+                ink::env::test::set_caller::<Environment>(member);
+                contract.register_member();
+            }
+
+            ink::env::test::set_caller::<Environment>(accounts.alice);
+
+            let mut tasks: Vec<String> = Vec::new();
+
+            let num_tasks: u8 = 100;
+            // create 100 tasks
+            for i in 0..num_tasks {
+                let task = String::from(format!("Task {}", i));
+                tasks.push(task.clone());
+
+                contract.add_task(task);
+            }
+
+            assert_eq!(contract.members.len(), num_members as usize);
+            assert_eq!(contract.members, members);
+            assert_eq!(contract.last_selection, init_block);
+
+            // advance block to selection era
+            advance_block(DEFAULT_SELECTION_ERA);
+
+            contract.start_new_era();
+
+            assert_eq!(
+                contract.last_selection,
+                init_block + contract.next_selection
+            );
+            assert_eq!(contract.active_participants.len(), 4);
+            assert_eq!(contract.active_task.is_some(), true);
+
+            // TODO: add distribution tests when randomness is added
+        }
+
+        // TODO: unit tests for:
+        // - upload_completion_proof
+        // - complete_task
+        // - start_new_era passes and panics when task complete and not complete, respectively
+
+        #[ink::test]
+        #[should_panic(expected = "Only owner can call")]
+        fn set_selection_era_panics() {
+            let mut contract = create_default_contract();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            ink::env::test::set_caller::<Environment>(accounts.eve);
+
+            contract.set_selection_era(20);
+        }
+
+        #[ink::test]
         #[should_panic(expected = "Member already exists")]
         fn register_member_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             contract.register_member();
             // Should panic here
@@ -474,7 +708,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Must be a member to call")]
         fn deregister_member_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             contract.deregister_member();
         }
@@ -482,7 +716,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Only owner can call")]
         fn clear_members_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -493,7 +727,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Task already exists")]
         fn add_task_twice_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             contract.register_member();
 
@@ -505,7 +739,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Must be a member to call")]
         fn add_task_when_not_member_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let task = String::from("Task");
             contract.add_task(task.clone());
@@ -514,7 +748,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Task does not exist")]
         fn remove_nonexistent_task_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             contract.register_member();
 
@@ -526,7 +760,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Only owner can call")]
         fn remove_task_when_not_member_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -542,7 +776,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Only owner can call")]
         fn clear_tasks_panic() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -561,7 +795,7 @@ mod polkapobal {
         #[ink::test]
         #[should_panic(expected = "Task does not exist")]
         fn fund_nonexistent_task_panics() {
-            let mut contract = Polkapobal::new();
+            let mut contract = create_default_contract();
 
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -574,6 +808,37 @@ mod polkapobal {
             let task = String::from("Task");
             // task does not exist
             ink::env::pay_with_call!(contract.fund_task(task), 10);
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Selection era not reached")]
+        fn start_new_era_when_era_not_reached_panics() {
+            advance_block(20);
+
+            let mut contract = create_default_contract();
+
+            contract.start_new_era();
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Must have at least one member")]
+        fn start_new_era_with_empty_members_panics() {
+            let mut contract = create_default_contract();
+
+            advance_block(DEFAULT_SELECTION_ERA);
+
+            contract.start_new_era();
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Must have at least one task")]
+        fn start_new_era_with_empty_tasks_panics() {
+            let mut contract = create_default_contract();
+            contract.register_member();
+
+            advance_block(DEFAULT_SELECTION_ERA);
+
+            contract.start_new_era();
         }
     }
 }
