@@ -281,16 +281,20 @@ mod polkapobal {
                 "Caller must be active participant"
             );
 
-            if let Some(task) = &self.active_task {
-                self.proofs.insert(&task.0, &proof);
-            }
+            let active_task = self.active_task.as_ref().expect("Active task must exist");
+            self.proofs.insert(&active_task.0, &proof);
         }
 
         #[ink(message)]
         pub fn complete_task(&mut self) {
             self.ensure_owner();
 
-            if let Some(task) = &self.active_task {
+            if let Some(task) = self.active_task.clone() {
+                self.active_task = Some((task.0.clone(), true));
+                let task_info = self.task_info.get(&task.0).expect("Task must exist");
+
+                self.disburse_rewards(self.active_participants.clone(), task_info.1);
+                // set reward balance to 0
                 self.task_info.insert(&task.0, &(true, 0));
             }
         }
@@ -367,6 +371,7 @@ mod polkapobal {
         }
 
         fn ensure_active_task_complete(&self) {
+            // TODO: benchmark against using self.tasks mapping
             if let Some(task) = &self.active_task {
                 assert!(task.1, "Active task must be completed");
             }
@@ -716,6 +721,35 @@ mod polkapobal {
         // - start_new_era passes and panics when task complete and not complete, respectively
 
         #[ink::test]
+        fn upload_completion_proof_works() {
+            let mut contract = create_default_contract();
+            advance_block(DEFAULT_SELECTION_ERA);
+
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            let task = String::from("Task");
+            let proof = Hash::from([0x01; 32]);
+
+            let mut members = Vec::new();
+            let num_members: u8 = 4;
+            for i in 0..num_members {
+                let member = AccountId::from([i; 32]);
+                members.push(member);
+
+                ink::env::test::set_caller::<Environment>(member);
+                contract.register_member();
+            }
+
+            contract.add_task(task.clone());
+            contract.start_new_era();
+
+            ink::env::test::set_caller::<Environment>(accounts.alice);
+            contract.upload_completion_proof(proof);
+
+            assert_eq!(contract.proofs.get(&task).unwrap(), proof);
+        }
+
+        #[ink::test]
         fn disburse_rewards_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
@@ -923,6 +957,20 @@ mod polkapobal {
             advance_block(DEFAULT_SELECTION_ERA);
 
             contract.start_new_era();
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Caller must be active participant")]
+        fn upload_completion_proof_not_participant_panics() {
+            let mut contract = create_default_contract();
+
+            let task = String::from("Task");
+            let proof = Hash::from([0x01; 32]);
+
+            contract.register_member();
+            contract.add_task(task.clone());
+
+            contract.upload_completion_proof(proof);
         }
     }
 }
