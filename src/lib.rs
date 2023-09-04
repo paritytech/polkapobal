@@ -2,7 +2,7 @@
 
 #[ink::contract]
 mod polkapobal {
-    use ink::{prelude::string::String, prelude::vec::Vec, storage::Mapping};
+    use ink::{env::debug_println, prelude::string::String, prelude::vec::Vec, storage::Mapping};
 
     #[ink(event)]
     pub struct SelectionEraChanged {
@@ -315,6 +315,36 @@ mod polkapobal {
 
             // TODO: use randomness
             self.tasks[Self::env().block_number() as usize % self.tasks.len()].clone()
+        }
+
+        fn disburse_rewards(&mut self, beneficiaries: Vec<AccountId>, amount: Balance) {
+            assert!(
+                Self::env().balance() >= amount,
+                "Contract has insufficient funds"
+            );
+
+            let amount_per_beneficiary = amount / beneficiaries.len() as u128;
+            let remainder = amount % beneficiaries.len() as u128;
+
+            beneficiaries.iter().for_each(|beneficiary| {
+                if self
+                    .env()
+                    .transfer(*beneficiary, amount_per_beneficiary)
+                    .is_err()
+                {
+                    // add failed transfer to unclaimed funds
+                    self.unclaimed_funds = self
+                        .unclaimed_funds
+                        .checked_add(amount_per_beneficiary)
+                        .expect("Balance overflow");
+                }
+            });
+
+            // Add the indivisable amount (remainder) to unclaimed funds
+            self.unclaimed_funds = self
+                .unclaimed_funds
+                .checked_add(remainder)
+                .expect("Balance overflow");
         }
 
         fn ensure_owner(&self) {
@@ -684,6 +714,60 @@ mod polkapobal {
         // - upload_completion_proof
         // - complete_task
         // - start_new_era passes and panics when task complete and not complete, respectively
+
+        #[ink::test]
+        fn disburse_rewards_works() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            let mut contract = create_default_contract();
+
+            let contract_address = contract.env().account_id();
+
+            let beneficiaries = vec![
+                accounts.bob,
+                accounts.charlie,
+                accounts.django,
+                accounts.eve,
+            ];
+
+            set_balance(contract_address, 1000);
+
+            // sanity check, set balances to 0
+            for beneficiary in beneficiaries.clone() {
+                set_balance(beneficiary, 0);
+            }
+
+            contract.disburse_rewards(beneficiaries.clone(), 100);
+
+            // closure to assert the balances of the beneficiaries
+            let assert_balances = |be: &Vec<AccountId>, expected_balance| {
+                for beneficiary in be {
+                    debug_println!("Beneficiary: {:?}", beneficiary);
+                    assert_eq!(get_balance(*beneficiary), expected_balance);
+                }
+            };
+
+            assert_eq!(get_balance(contract_address), 900);
+            assert_balances(&beneficiaries, 25);
+
+            // indivisable by 4
+            let indivisable_amount: Balance = 75;
+            let beneficiary_amount = indivisable_amount / 4;
+            let remainder = indivisable_amount % 4;
+
+            // sanity check, ensure amount is truncated to 18
+            assert_eq!(beneficiary_amount, 18);
+
+            contract.disburse_rewards(beneficiaries.clone(), indivisable_amount);
+
+            // remainder is 3, so only 72 is disbursed
+            assert_eq!(
+                get_balance(contract_address),
+                900 - (indivisable_amount - remainder)
+            );
+            assert_balances(&beneficiaries, 25 + beneficiary_amount);
+            assert_eq!(contract.unclaimed_funds, remainder);
+        }
 
         #[ink::test]
         #[should_panic(expected = "Only owner can call")]
