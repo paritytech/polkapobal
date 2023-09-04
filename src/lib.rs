@@ -716,8 +716,6 @@ mod polkapobal {
         }
 
         // TODO: unit tests for:
-        // - upload_completion_proof
-        // - complete_task
         // - start_new_era passes and panics when task complete and not complete, respectively
 
         #[ink::test]
@@ -747,6 +745,52 @@ mod polkapobal {
             contract.upload_completion_proof(proof);
 
             assert_eq!(contract.proofs.get(&task).unwrap(), proof);
+        }
+
+        #[ink::test]
+        fn complete_task_works() {
+            let mut contract = create_default_contract();
+            advance_block(DEFAULT_SELECTION_ERA);
+
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            let task = String::from("Task");
+            let proof = Hash::from([0x01; 32]);
+
+            let mut members = Vec::new();
+            let num_members: u8 = 4;
+            for i in 2..num_members + 2 {
+                let member = AccountId::from([i; 32]);
+                members.push(member);
+
+                set_balance(member, 0);
+
+                ink::env::test::set_caller::<Environment>(member);
+                contract.register_member();
+            }
+
+            ink::env::test::set_caller::<Environment>(accounts.bob);
+            set_balance(accounts.bob, 100);
+
+            contract.add_task(task.clone());
+            ink::env::pay_with_call!(contract.fund_task(task.clone()), 80);
+            set_balance(accounts.bob, 0);
+
+            contract.start_new_era();
+
+            contract.upload_completion_proof(proof);
+
+            ink::env::test::set_caller::<Environment>(accounts.alice);
+            contract.complete_task();
+
+            assert_eq!(contract.active_task.unwrap().1, true);
+            let task_info = contract.task_info.get(&task).unwrap();
+            assert_eq!(task_info.0, true);
+            assert_eq!(task_info.1, 0);
+
+            for member in members {
+                assert_eq!(get_balance(member), 20);
+            }
         }
 
         #[ink::test]
@@ -971,6 +1015,16 @@ mod polkapobal {
             contract.add_task(task.clone());
 
             contract.upload_completion_proof(proof);
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Only owner can call")]
+        fn complete_task_not_owner_panics() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let mut contract = create_default_contract();
+
+            ink::env::test::set_caller::<Environment>(accounts.eve);
+            contract.complete_task();
         }
     }
 }
